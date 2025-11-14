@@ -1,0 +1,11 @@
+SpeechRecognition
+pyttsx3
+pyaudio
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+python-dateutil
+tzlocal
+Flask
+google-generativeai
