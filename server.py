@@ -1,316 +1,263 @@
+# server.py
 from __future__ import print_function
 from datetime import datetime, timedelta
-import os, json
-import speech_recognition as sr
-import pyttsx3
+import os
+import json
+from typing import Optional
 from dateutil import parser
 import tzlocal
-
-# Google Calendar API
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from flask import Flask, request, jsonify
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
-
-# AI
 import google.generativeai as genai
 
-# -------- CONFIGURATION --------
-SCOPES = ['https://www.googleapis.com/auth/calendar']
+# ---- CONFIG ----
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# -------- SPEECH UTILITIES --------
-engine = pyttsx3.init('sapi5')  # Windows Text-to-Speech
-engine.setProperty('rate', 170)  # Speech rate
+app = Flask(__name__)
 
-import time
 
-def speak(text):
-    """Speak text aloud and print it to console."""
-    print("🗨️", text)
-    try:
-        engine = pyttsx3.init()  # Re-initialize engine each call to avoid Windows TTS issues
-        engine.say(text)
-        engine.runAndWait()
-    except Exception as e:
-        print(f"⚠️ Speech engine error: {e}")
-
-def listen():
-    """Listen from microphone and return text."""
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("\n🎤 Listening...")
-        r.adjust_for_ambient_noise(source)
-        audio = r.listen(source)
-    try:
-        text = r.recognize_google(audio)
-        print(f"🗣️ You said: {text}")
-        return text
-    except sr.UnknownValueError:
-        speak("Sorry, I didn't catch that. Could you repeat?")
-        return listen()
-    except sr.RequestError:
-        speak("Speech recognition service is unavailable.")
-        return ""
-
-# -------- GOOGLE CALENDAR LOGIN --------
+# ---- HELPERS ----
 def get_calendar_service():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    service = build('calendar', 'v3', credentials=creds)
+    """
+    Create a Google Calendar service using a service account JSON stored in env var.
+    GOOGLE_SERVICE_ACCOUNT_JSON should contain the full JSON contents.
+    """
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set in environment")
+
+    info = json.loads(raw)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    service = build("calendar", "v3", credentials=creds)
     return service
 
-# -------- AI EVENT EXTRACTION --------
-def extract_event_details(text):
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    now = datetime.now().isoformat()
-    prompt = f"""
-    Today is {now}.
-    Extract calendar event details from this message.
-    Return only JSON in this format:
-    {{
-      "title": "Event title",
-      "start": "YYYY-MM-DDTHH:MM:SS",
-      "end": "YYYY-MM-DDTHH:MM:SS",
-      "location": "Location name"
-    }}
-    Message: {text}
-    """
-    response = model.generate_content(prompt)
-    cleaned = response.text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`").replace("json", "").strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        speak("⚠️ Couldn't parse AI output.")
-        print("Raw output:", response.text)
-        return {}
 
-# -------- FILL MISSING FIELDS --------
-def fill_missing_fields(event, service):
-    """Ask for missing fields and handle cancellations."""
-    now = datetime.now()
-
-    # Ask for missing title
-    if not event.get("title"):
-        speak("What should I call this event?")
-        title = listen()
-        if title.lower() in ["cancel", "nevermind"]:
-            speak("Event creation has been cancelled.")
-            return None
-        event["title"] = title
-
-    # Ask for missing start time
-    if not event.get("start"):
-        speak("When does it start?")
-        start = listen()
-        if start.lower() in ["cancel", "nevermind"]:
-            speak("Event creation has been cancelled.")
-            return None
-        event["start"] = parse_natural_time(start, now)
-
-    # Ask for missing end time
-    if not event.get("end"):
-        speak("When does it end?")
-        end = listen()
-        if end.lower() in ["cancel", "nevermind"]:
-            speak("Event creation has been cancelled.")
-            return None
-        event["end"] = parse_natural_time(end, now)
-
-    # Ask for missing location
-    if not event.get("location"):
-        speak("Where is it happening?")
-        location = listen()
-        if location.lower() in ["cancel", "nevermind"]:
-            speak("Event creation has been cancelled.")
-            return None
-        event["location"] = location
-
-    # Check for conflicts immediately after getting times
-    new_start, new_end, _ = check_for_conflicts(
-        service, event["start"], event["end"]
-    )
-    event["start"] = new_start
-    event["end"] = new_end
-
-    return event
-
-# -------- PARSE TIME --------
-def parse_natural_time(text, base_time=None):
-    if not text:
+def safe_parse(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
         return None
-    if base_time is None:
-        base_time = datetime.now()
     try:
-        dt = parser.parse(text, default=base_time)
-        return dt.strftime("%Y-%m-%dT%H:%M:%S")
-    except Exception as e:
-        speak(f"⚠️ Couldn't parse time '{text}'")
-        print(f"Error: {e}")
-        return base_time.strftime("%Y-%m-%dT%H:%M:%S")
+        return parser.parse(dt_str)
+    except Exception:
+        return None
 
-# -------- FORMAT DATETIME FOR SPEECH --------
-def format_datetime_for_speech(dt_str):
+
+def iso_format(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def human_readable(dt_str: str) -> str:
+    """
+    Convert an ISO-like datetime to a human-friendly string.
+    Example: "Thursday, November 13 at 6:00 PM"
+    """
+    dt = safe_parse(dt_str)
+    if not dt:
+        return dt_str
     try:
-        dt = parser.parse(dt_str)
-        return dt.strftime("%A, %B %d at %-I:%M %p")
+        # Use platform-friendly format (avoid %-d on some platforms)
+        return dt.strftime("%A, %B %d at %I:%M %p").replace(" 0", " ")
     except Exception:
         return dt_str
 
-# -------- CHECK CONFLICTS --------
-def check_for_conflicts(service, start_datetime, end_datetime):
+
+def format_range(start_iso: str, end_iso: str) -> str:
+    s = safe_parse(start_iso)
+    e = safe_parse(end_iso)
+    if not s or not e:
+        return f"{start_iso} to {end_iso}"
+
+    date_part = s.strftime("%m/%d/%Y")
+
+    # Cross-platform hour formatting
+    start_t = s.strftime("%I:%M %p").lstrip("0")
+    end_t = e.strftime("%I:%M %p").lstrip("0")
+
+    return f"{date_part} {start_t} - {end_t}"
+
+# ---- AI extraction wrapper ----
+def extract_event_details_with_gemini(text: str) -> dict:
     """
-    Checks for calendar event conflicts and asks the user if they want to reschedule.
-    Speaks events in a legible format like 'Dinner on 11/13/2025 6-7 PM'.
+    Uses Gemini to extract title/start/end/location as JSON.
+    Returns a dict with those keys (may be empty strings).
     """
-    from datetime import timedelta
-    from dateutil import parser
-    import tzlocal
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    now = datetime.now().isoformat()
+    prompt = f"""
+Today is {now}.
+Extract calendar event details from this message.
+Return only JSON in this exact format:
+{{
+  "title": "Event title",
+  "start": "YYYY-MM-DDTHH:MM:SS",
+  "end": "YYYY-MM-DDTHH:MM:SS",
+  "location": "Location name"
+}}
 
-    def format_event_time_range(start_str, end_str):
-        """Convert ISO datetimes into legible range like '11/13/2025 6-7 PM'."""
-        try:
-            start_dt = parser.parse(start_str)
-            end_dt = parser.parse(end_str)
-            date_part = start_dt.strftime("%m/%d/%Y")
-            start_hour = start_dt.strftime("%-I")
-            end_hour = end_dt.strftime("%-I %p")
-            # If start and end are in different AM/PM, include AM/PM on start
-            if start_dt.strftime("%p") != end_dt.strftime("%p"):
-                start_hour += f" {start_dt.strftime('%p')}"
-            return f"{date_part} {start_hour}-{end_hour}"
-        except Exception:
-            return f"{start_str} to {end_str}"
-
+If any value is not present in the message, return an empty string for that field.
+Message: {text}
+"""
+    resp = model.generate_content(prompt)
+    cleaned = resp.text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").replace("json", "").strip()
     try:
-        tz = tzlocal.get_localzone()
-        start = parser.parse(start_datetime)
-        end = parser.parse(end_datetime)
-
-        # Add timezone if missing
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=tz)
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=tz)
-
-        # Ensure valid time range
-        if end <= start:
-            end = start + timedelta(hours=1)
-
-        time_min = start.isoformat()
-        time_max = end.isoformat()
-
-    except Exception as e:
-        print(f"⚠️ Couldn't parse datetimes: {e}")
-        speak("Sorry, I couldn’t understand the time you gave me.")
-        return start_datetime, end_datetime, False
-
-    try:
-        events_result = (
-            service.events()
-            .list(
-                calendarId='primary',
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy='startTime'
-            )
-            .execute()
-        )
-
-        events = events_result.get('items', [])
-
-        if events:
-            speak("You already have the following event scheduled:")
-            conflict_messages = []
-            for event in events:
-                event_title = event.get('summary', 'Untitled Event')
-                event_start = event['start'].get('dateTime', event['start'].get('date', ''))
-                event_end = event['end'].get('dateTime', event['end'].get('date', ''))
-                msg = f"{event_title} on {format_event_time_range(event_start, event_end)}"
-                conflict_messages.append(msg)
-                speak(msg)  # speak each conflict individually
-
-            # Ask if user wants to reschedule
-            speak("Would you like to reschedule your new event?")
-            response = listen().lower()
-
-            if "reschedule" in response or "change" in response or "yes" in response:
-                speak("What time would you like to move it to?")
-                new_time_response = listen()
-                try:
-                    new_start = parser.parse(new_time_response, default=start)
-                except Exception:
-                    speak("I didn't understand that time. Keeping original time.")
-                    return start_datetime, end_datetime, True
-
-                new_end = new_start + timedelta(hours=1)
-                return new_start.strftime("%Y-%m-%dT%H:%M:%S"), new_end.strftime("%Y-%m-%dT%H:%M:%S"), True
-
-            else:
-                speak("Okay, keeping the original time.")
-                return start_datetime, end_datetime, True
-
-        # No conflicts
-        return start_datetime, end_datetime, False
-
-    except Exception as e:
-        print(f"⚠️ Error while checking for conflicts: {e}")
-        speak("Sorry, there was a problem checking your calendar.")
-        return start_datetime, end_datetime, False
-
-# -------- ADD EVENT --------
-def add_event_to_calendar(service, title, start_datetime, end_datetime, location=""):
-    if title is None or start_datetime is None or end_datetime is None:
-        speak("Event creation cancelled.")
-        return
-
-    start_datetime, end_datetime, _ = check_for_conflicts(service, start_datetime, end_datetime)
-    try:
-        tz = tzlocal.get_localzone_name()
+        data = json.loads(cleaned)
+        # Ensure keys exist
+        return {
+            "title": data.get("title", "") if isinstance(data, dict) else "",
+            "start": data.get("start", "") if isinstance(data, dict) else "",
+            "end": data.get("end", "") if isinstance(data, dict) else "",
+            "location": data.get("location", "") if isinstance(data, dict) else "",
+        }
     except Exception:
-        tz = "UTC"
+        # Best-effort fallback: return blanks
+        return {"title": "", "start": "", "end": "", "location": ""}
 
-    event = {
-        'summary': title,
-        'location': location,
-        'start': {'dateTime': start_datetime, 'timeZone': tz},
-        'end': {'dateTime': end_datetime, 'timeZone': tz},
-    }
 
-    try:
-        service.events().insert(calendarId='primary', body=event).execute()
-        speak(f"Your event '{title}' has been added to the calendar.")
-    except Exception as e:
-        speak("There was a problem adding your event.")
-        print(f"⚠️ Failed to add event: {e}")
+# ---- CALENDAR FUNCTIONS ----
+def check_conflicts(service, start_iso: str, end_iso: str):
+    tz = tzlocal.get_localzone()
+    start_dt = safe_parse(start_iso)
+    end_dt = safe_parse(end_iso)
+    if not start_dt or not end_dt:
+        return []
 
-# -------- RUN LOCAL VOICE-ONLY MODE --------
-if __name__ == '__main__':
-    service = get_calendar_service()
-    speak("Tell me about your event.")
-    user_input = listen()
-    extracted = extract_event_details(user_input)
-    final_event = fill_missing_fields(extracted, service)
+    # Attach timezone if missing
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=tz)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=tz)
+    if end_dt <= start_dt:
+        end_dt = start_dt + timedelta(hours=1)
 
-    if final_event is None:
-        speak("Event creation has been cancelled. Goodbye!")
-    else:
-        add_event_to_calendar(
-            service,
-            title=final_event["title"],
-            start_datetime=final_event["start"],
-            end_datetime=final_event["end"],
-            location=final_event["location"]
+    events_result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=start_dt.isoformat(),
+            timeMax=end_dt.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
         )
+        .execute()
+    )
+    items = events_result.get("items", [])
+    conflicts = []
+    for e in items:
+        title = e.get("summary", "Untitled Event")
+        s = e["start"].get("dateTime", e["start"].get("date", ""))
+        e_t = e["end"].get("dateTime", e["end"].get("date", ""))
+        conflicts.append({"title": title, "start": s, "end": e_t})
+    return conflicts
+
+
+def add_event_to_calendar(service, title: str, start_iso: str, end_iso: str, location: str = ""):
+    tz_name = tzlocal.get_localzone_name()
+    body = {
+        "summary": title,
+        "location": location,
+        "start": {"dateTime": start_iso, "timeZone": tz_name},
+        "end": {"dateTime": end_iso, "timeZone": tz_name},
+    }
+    created = service.events().insert(calendarId="primary", body=body).execute()
+    return created
+
+
+# ---- ROUTES (Option B) ----
+
+@app.route("/extract", methods=["POST"])
+def route_extract():
+    """
+    Input: { "text": "user spoken text here" }
+    Output: { title, start, end, location, spoken_response }
+    """
+    payload = request.json or {}
+    text = payload.get("text", "")
+    if not text:
+        return jsonify({"error": "No text provided", "spoken_response": "I didn't hear anything."}), 400
+
+    extracted = extract_event_details_with_gemini(text)
+    # Build a friendly spoken_response summarizing extraction
+    title = extracted.get("title", "")
+    start = extracted.get("start", "")
+    end = extracted.get("end", "")
+    location = extracted.get("location", "")
+
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    if start:
+        parts.append(f"Start: {human_readable(start)}")
+    if end:
+        parts.append(f"End: {human_readable(end)}")
+    if location:
+        parts.append(f"Location: {location}")
+
+    if parts:
+        spoken = "I extracted the following — " + "; ".join(parts) + ". Is that correct?"
+    else:
+        spoken = "I couldn't find clear event details in that. What is the title, start, end, or location?"
+
+    return jsonify({**extracted, "spoken_response": spoken})
+
+
+@app.route("/check_conflicts", methods=["POST"])
+def route_check_conflicts():
+    """
+    Input: { "start": "...", "end": "..." }
+    Output: { conflicts: [...], spoken_response: "..." }
+    """
+    payload = request.json or {}
+    start = payload.get("start")
+    end = payload.get("end")
+    if not start or not end:
+        return jsonify({"error": "start and end required", "spoken_response": "I need both start and end times to check for conflicts."}), 400
+
+    service = get_calendar_service()
+    conflicts = check_conflicts(service, start, end)
+    if not conflicts:
+        spoken = f"No conflicts found for {human_readable(start)}."
+    else:
+        spoken_items = []
+        for c in conflicts:
+            spoken_items.append(f"{c['title']} on {format_range(c['start'], c['end'])}")
+        spoken = "You already have the following event(s): " + "; ".join(spoken_items) + ". Would you like to reschedule the new event?"
+    return jsonify({"conflicts": conflicts, "spoken_response": spoken})
+
+
+@app.route("/add_event", methods=["POST"])
+def route_add_event():
+    """
+    Input: { title, start, end, location (optional) }
+    Output: { status, event_id, spoken_response }
+    """
+    payload = request.json or {}
+    title = payload.get("title")
+    start = payload.get("start")
+    end = payload.get("end")
+    location = payload.get("location", "")
+
+    if not title or not start or not end:
+        return jsonify({"error": "title, start, end required", "spoken_response": "I need title, start, and end to add the event."}), 400
+
+    service = get_calendar_service()
+    try:
+        created = add_event_to_calendar(service, title, start, end, location)
+        event_id = created.get("id")
+        spoken = f"Added {title} on {format_range(start, end)}."
+        return jsonify({"status": "added", "event_id": event_id, "spoken_response": spoken})
+    except Exception as e:
+        print("Error adding event:", e)
+        return jsonify({"error": "failed_to_add", "spoken_response": "I couldn't add the event due to a server error."}), 500
+
+
+# Health check
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "ok"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
