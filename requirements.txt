@@ -6,3 +6,4 @@ python-dateutil
 tzlocal
 Flask
 google-generativeai
+gunicorn
